@@ -1,6 +1,6 @@
 {
-  "60bfdc4525abd872b20ac78e249a73d7a7c7d12b4f185215f8de3a5a083a3f9e": {
-    "owner": "Demo User",
+  "bc64cbc5a172d917eac41017bcddca8eef68c0113370fbba098239d8642dfa99": {
+    "owner": "Admin VÀ TÔI",
     "status": "active",
     "expires_at": "2026-12-31",
     "allow_app": true,
@@ -8,7 +8,27 @@
     "allowed_machines": [
       "*"
     ],
-    "blocked_machines": [],
-    "note": "Demo license key: HUMG-DEMO-2026-001"
-  }
+    "blocked_machines": []"
+  },
+  "29260eb958d771ceaf9e41f983717cf4c5699fc3ff7a51bcb49e05a9fc571621": {
+    "owner": "License mới của Hương",
+    "status": "active",
+    "expires_at": "2026-12-31",
+    "allow_app": true,
+    "allow_petrel_export": true,
+    "allowed_machines": [
+      "*"
+    ],
+    "blocked_machines": []"
+  },
+  "a12c77651d701f8f8b29f671877c025ee5cbe39177d421296fddfd6ed402aeae": {
+    "owner": "License mới của Tú",
+    "status": "active",
+    "expires_at": "2026-12-31",
+    "allow_app": true,
+    "allow_petrel_export": true,
+    "allowed_machines": [
+      "*"
+    ],
+    "blocked_machines": []"
 }
