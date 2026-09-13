@@ -8,7 +8,7 @@
     "allowed_machines": [
       "*"
     ],
-    "blocked_machines": []"
+    "blocked_machines": []
   },
   "29260eb958d771ceaf9e41f983717cf4c5699fc3ff7a51bcb49e05a9fc571621": {
     "owner": "License mới của Hương",
@@ -19,7 +19,7 @@
     "allowed_machines": [
       "*"
     ],
-    "blocked_machines": []"
+    "blocked_machines": []
   },
   "a12c77651d701f8f8b29f671877c025ee5cbe39177d421296fddfd6ed402aeae": {
     "owner": "License mới của Tú",
@@ -30,5 +30,6 @@
     "allowed_machines": [
       "*"
     ],
-    "blocked_machines": []"
+    "blocked_machines": []
+  }
 }
