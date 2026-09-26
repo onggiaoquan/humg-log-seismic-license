@@ -28,7 +28,7 @@
     "allow_app": true,
     "allow_petrel_export": true,
     "allowed_machines": [
-      "*"
+      "0fd746e08f5e1b8f3ad7a27b5e33b2015aaedd4d01f05d9bd04bf9e48fca4db1"
     ],
     "blocked_machines": []
   }
