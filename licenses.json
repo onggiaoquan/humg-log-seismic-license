@@ -28,7 +28,8 @@
     "allow_app": true,
     "allow_petrel_export": true,
     "allowed_machines": [
-      "0fd746e08f5e1b8f3ad7a27b5e33b2015aaedd4d01f05d9bd04bf9e48fca4db1"
+      "0fd746e08f5e1b8f3ad7a27b5e33b2015aaedd4d01f05d9bd04bf9e48fca4db1",
+      "958fa6a5624ab05ac000f01f6f29939d52cc0702ed81a9d396743c8bc6396ee7"
     ],
     "blocked_machines": []
   }
