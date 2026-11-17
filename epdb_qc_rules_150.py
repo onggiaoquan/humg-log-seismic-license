@@ -32,7 +32,7 @@ ACTIVE_DOCX_CRITERIA = {
     ],
     "Coordinate QC": [
         "X Coordinate", "Y Coordinate", "CRS khai báo", "CRS hợp lệ", "UTM Zone đúng",
-        "X Range hợp lệ", "Y Range hợp lệ", "Well nằm trong Block", "Well nằm trong License",
+        "Longitude hợp lệ", "Latitude hợp lệ", "Well nằm trong Block", "Well nằm trong License",
         "Surface không trùng", "KB Elevation hợp lệ", "Water Depth hợp lệ",
     ],
     "Wellbore QC": [
@@ -271,6 +271,24 @@ COLUMN_ALIASES: dict[str, dict[str, list[str]]] = {
 # CUU LONG FIXED SCHEMA - COLUMN MAPPINGS
 # ============================================================
 
+# Additional mappings for Phase 1 QC
+COLUMN_ALIASES["epdb_well"].update({
+    "well_id": ["well_id"],
+})
+
+COLUMN_ALIASES["epdb_borehole"].update({
+    "well_id": ["well_id"],
+    "completion_date": ["completion_date"],
+})
+
+COLUMN_ALIASES["epdb_block"].update({
+    "operator": ["operator"],
+})
+
+COLUMN_ALIASES["epdb_basin"].update({
+    "country": ["country"],
+})
+
 COLUMN_ALIASES["epdb_well"].update({
     "uwi": ["well_code"],
     "well_status": ["status"],
@@ -388,8 +406,7 @@ _s("WH-07", "epdb_well", "enum_values",
    dimensions=["Completeness", "Validity"])
 
 # 8. Operator: không Null
-_s("WH-08", "epdb_well", "required",
-   column="operator",
+_s("WH-08", "epdb_well", "required_join_block_operator",
    dimensions=["Completeness"])
 
 # 9. Field: phải có giá trị và Field tham chiếu phải tồn tại.
@@ -412,8 +429,7 @@ _s("WH-11", "epdb_well", "well_basin_chain",
    dimensions=["Completeness", "Validity", "Consistency"])
 
 # 12. Country: không Null
-_s("WH-12", "epdb_well", "required",
-   column="country",
+_s("WH-12", "epdb_well", "required_join_basin_country",
    dimensions=["Completeness"])
 
 # 13. Spud Date: phải là ngày hợp lệ, không chỉ là chuỗi có dữ liệu.
@@ -423,9 +439,7 @@ _s("WH-13", "epdb_well", "date_required",
 
 # 14. Completion Date >= Spud Date.
 # Evaluator date_order phải phân tích thành ngày trước khi so sánh.
-_s("WH-14", "epdb_well", "date_order",
-   column="completion_date",
-   other_column="spud_date",
+_s("WH-14", "epdb_well", "completion_date_order",
    dimensions=["Completeness", "Validity", "Consistency"])
 
 
@@ -464,17 +478,17 @@ _s("CO-05", "epdb_well", "utm_zone_valid",
 
 # 6. X nằm trong giới hạn của Block/Asset.
 # Chỉ đánh giá khi giới hạn, CRS và đơn vị tham chiếu hợp lệ.
-_s("CO-06", "epdb_well", "range_reference",
+_s("CO-06", "epdb_well", "range",
    column="x_coordinate",
-   axis="x",
-   path="well",
+   minimum=-180,
+   maximum=180,
    dimensions=["Accuracy", "Validity"])
 
 # 7. Y nằm trong giới hạn của Block/Asset.
-_s("CO-07", "epdb_well", "range_reference",
+_s("CO-07", "epdb_well", "range",
    column="y_coordinate",
-   axis="y",
-   path="well",
+   minimum=-90,
+   maximum=90,
    dimensions=["Accuracy", "Validity"])
 
 # 8. Well nằm trong phạm vi Block đã khai báo.
@@ -1064,6 +1078,61 @@ def build_checks(table_exists_fn, table_columns_fn, normalize_fn, quote_ident_fn
             needed_tables.add(spec["child_table"])
         if spec.get("parent_table"):
             needed_tables.add(spec["parent_table"])
+        # Phase 1: required fields inherited through Well -> Field -> Block.
+        if kind == "required_join_block_operator":
+            needed_tables.update({"epdb_field", "epdb_block"})
+
+            requirements.setdefault("epdb_well", []).append("field_id")
+
+            requirements.setdefault("epdb_field", []).extend([
+                "field_id",
+                "block_id",
+            ])
+
+            requirements.setdefault("epdb_block", []).extend([
+                "block_id",
+                "operator",
+            ])
+
+        # Phase 1: country inherited through Well -> Field -> Block -> Basin.
+        elif kind == "required_join_basin_country":
+            needed_tables.update({
+                "epdb_field",
+                "epdb_block",
+                "epdb_basin",
+            })
+
+            requirements.setdefault("epdb_well", []).append("field_id")
+
+            requirements.setdefault("epdb_field", []).extend([
+                "field_id",
+                "block_id",
+            ])
+
+            requirements.setdefault("epdb_block", []).extend([
+                "block_id",
+                "basin_id",
+            ])
+
+            requirements.setdefault("epdb_basin", []).extend([
+                "basin_id",
+                "country",
+            ])
+
+        # Phase 1: Completion Date belongs to Borehole, Spud Date belongs to Well.
+        elif kind == "completion_date_order":
+            needed_tables.add("epdb_borehole")
+
+            requirements.setdefault("epdb_well", []).extend([
+                "well_id",
+                "spud_date",
+            ])
+
+            requirements.setdefault("epdb_borehole", []).extend([
+                "well_id",
+                "completion_date",
+            ])
+
         if kind == "missing_formation":
             needed_tables.add("epdb_stratigraphy")
         if kind in {"well_block_chain", "well_basin_chain"}:
@@ -1390,13 +1459,107 @@ def build_checks(table_exists_fn, table_columns_fn, normalize_fn, quote_ident_fn
 
             base["empty_population_status"] = "Chưa có dữ liệu"
 
-        if kind in {"required", "date_required", "required_pattern", "range", "min", "max", "positive", "nonnegative", "not_sentinel", "sentinel_any", "boolean_true", "enum_values", "crs_valid", "utm_zone_valid", "within_block", "status_pass", "multi_required", "date_order", "compare_le", "compare_lt", "planned_td", "gross_ge_net", "hi_formula", "abs_less_than", "consistent_group", "age_consistency", "interval_order", "interval_gap", "max_gap", "sequence_increasing", "cumulative_increasing", "missing_month", "export_status", "conditional_sidetrack", "foreign_key", "dictionary", "range_reference", "within_parent_td", "depth_within_survey", "survey_reaches_td", "has_child", "has_child_by_key", "child_required", "unique", "well_block_chain", "well_basin_chain", "missing_formation", "document_reference", "document_file"}:
+        if kind in {"required_join_block_operator", "required_join_basin_country", "completion_date_order", "required", "date_required", "required_pattern", "range", "min", "max", "positive", "nonnegative", "not_sentinel", "sentinel_any", "boolean_true", "enum_values", "crs_valid", "utm_zone_valid", "within_block", "status_pass", "multi_required", "date_order", "compare_le", "compare_lt", "planned_td", "gross_ge_net", "hi_formula", "abs_less_than", "consistent_group", "age_consistency", "interval_order", "interval_gap", "max_gap", "sequence_increasing", "cumulative_increasing", "missing_month", "export_status", "conditional_sidetrack", "foreign_key", "dictionary", "range_reference", "within_parent_td", "depth_within_survey", "survey_reaches_td", "has_child", "has_child_by_key", "child_required", "unique", "well_block_chain", "well_basin_chain", "missing_formation", "document_reference", "document_file"}:
             pass
         else:
             return {**base, "schema_missing": [f"No evaluator for kind={kind}"]}
 
         # Simple row predicates.
-        if kind == "required":
+        # WH-08: Operator is inherited from Block.
+        if kind == "required_join_block_operator":
+
+            well_field = q("epdb_well", "field_id", "t")
+            field_id = q("epdb_field", "field_id", "f")
+            field_block = q("epdb_field", "block_id", "f")
+
+            block_id = q("epdb_block", "block_id", "b")
+            operator = q("epdb_block", "operator", "b")
+
+            from_sql = (
+                f"FROM {quote_ident_fn('epdb_well')} t "
+                f"LEFT JOIN {quote_ident_fn('epdb_field')} f "
+                f"ON {field_id} = {well_field} "
+                f"LEFT JOIN {quote_ident_fn('epdb_block')} b "
+                f"ON {block_id} = {field_block}"
+            )
+
+            condition = (
+                f"({block_id} IS NULL OR {_blank(operator)})"
+            )
+
+            population_from = from_sql
+            population_condition = "TRUE"
+
+        # WH-12: Country is inherited from Basin.
+        elif kind == "required_join_basin_country":
+
+            well_field = q("epdb_well", "field_id", "t")
+            field_id = q("epdb_field", "field_id", "f")
+            field_block = q("epdb_field", "block_id", "f")
+
+            block_id = q("epdb_block", "block_id", "b")
+            block_basin = q("epdb_block", "basin_id", "b")
+
+            basin_id = q("epdb_basin", "basin_id", "ba")
+            country = q("epdb_basin", "country", "ba")
+
+            from_sql = (
+                f"FROM {quote_ident_fn('epdb_well')} t "
+                f"LEFT JOIN {quote_ident_fn('epdb_field')} f "
+                f"ON {field_id} = {well_field} "
+                f"LEFT JOIN {quote_ident_fn('epdb_block')} b "
+                f"ON {block_id} = {field_block} "
+                f"LEFT JOIN {quote_ident_fn('epdb_basin')} ba "
+                f"ON {basin_id} = {block_basin}"
+            )
+
+            condition = (
+                f"({basin_id} IS NULL OR {_blank(country)})"
+            )
+
+            population_from = from_sql
+            population_condition = "TRUE"
+
+        # WH-14: Completion Date must not precede Spud Date.
+        elif kind == "completion_date_order":
+
+            well_id = q("epdb_well", "well_id", "t")
+            spud_date = q("epdb_well", "spud_date", "t")
+
+            borehole_well_id = q(
+                "epdb_borehole", "well_id", "bh"
+            )
+            completion_date = q(
+                "epdb_borehole", "completion_date", "bh"
+            )
+
+            from_sql = (
+                f"FROM {quote_ident_fn('epdb_well')} t "
+                f"LEFT JOIN {quote_ident_fn('epdb_borehole')} bh "
+                f"ON {borehole_well_id} = {well_id}"
+            )
+
+            completion_parsed = _date_value(completion_date)
+            spud_parsed = _date_value(spud_date)
+
+            # Chỉ đánh giá thân giếng đã có Completion Date.
+            population_condition = (
+                f"NOT {_blank(completion_date)}"
+            )
+
+            condition = (
+                f"(NOT {_blank(completion_date)} "
+                f"AND ("
+                f"({completion_parsed}) IS NULL "
+                f"OR ({spud_parsed}) IS NULL "
+                f"OR ({completion_parsed}) < ({spud_parsed})"
+                f"))"
+            )
+
+            population_from = from_sql
+
+        # Existing evaluators.
+        elif kind == "required":
             condition = _blank(q(table, spec["column"]))
         elif kind == "date_required":
             date_expr = _date_value(q(table, spec["column"]))
