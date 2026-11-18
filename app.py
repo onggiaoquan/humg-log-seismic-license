@@ -4851,15 +4851,413 @@ def render_ai_alert_dashboard(db_engine):
         mime="text/csv", key="download_ai_alerts_csv",
     )
 
-if active_dashboard_view == "Cảnh báo AI":
+# ---------------------------------------------------------
+# 4.4 PRESSURE AI — WHP ANOMALY DETECTION
+# ---------------------------------------------------------
+_PRESSURE_AI_FEATURE_COLUMNS = [
+    "delta_psi",
+    "abs_delta_psi",
+    "relative_delta_pct",
+    "residual_prev_median_psi",
+    "robust_z_prev",
+    "past_mad_5_psi",
+    "rolling_std_4_psi",
+    "rolling_range_4_psi",
+    "rolling_unique_4",
+    "same_value_run",
+    "delta_acceleration_psi",
+    "days_since_previous",
+]
+
+
+@st.cache_resource(show_spinner=False)
+def _load_pressure_ai_model_cached(model_path: str, model_mtime_ns: int):
+    """Load the trained WHP model once per model-file version."""
+    import joblib
+
+    artifact = joblib.load(model_path)
+    if not isinstance(artifact, dict) or "pipeline" not in artifact or "metadata" not in artifact:
+        raise ValueError("File .joblib không đúng định dạng mô hình EPDB Pressure AI.")
+    metadata = artifact["metadata"]
+    if metadata.get("pressure_channel") != "WHP":
+        raise ValueError("Mô hình này không được huấn luyện cho kênh WHP.")
+    if list(metadata.get("features") or []) != _PRESSURE_AI_FEATURE_COLUMNS:
+        raise ValueError("Danh sách đặc trưng trong model không khớp với app.py.")
+    if "validation" not in metadata or "threshold" not in metadata["validation"]:
+        raise ValueError("Model thiếu ngưỡng phân loại trong metadata.")
+    return artifact
+
+
+@st.cache_data(ttl=180, show_spinner=False)
+def _load_pressure_ai_source_cached() -> pd.DataFrame:
+    """Read WHP from the current Cuu Long schema; read-only, no DDL or writes."""
+    sql = """
+        SELECT
+            p.production_id::text AS record_id,
+            BTRIM(b.wellbore_code::text) AS ubhi,
+            COALESCE(
+                NULLIF(BTRIM(w.well_name::text), ''),
+                NULLIF(BTRIM(w.well_code::text), ''),
+                BTRIM(b.wellbore_code::text)
+            ) AS well_name,
+            BTRIM(b.wellbore_code::text) AS borehole_name,
+            p.production_month::text AS pressure_date,
+            p.whp_psi::double precision AS pressure_value
+        FROM public.epdb_production p
+        JOIN public.epdb_borehole b
+            ON b.wellbore_id = p.wellbore_id
+        LEFT JOIN public.epdb_well w
+            ON w.well_id = b.well_id
+        WHERE b.wellbore_code IS NOT NULL
+          AND p.production_month IS NOT NULL
+          AND p.whp_psi IS NOT NULL
+          AND p.whp_psi > 0
+        ORDER BY b.wellbore_code, p.production_month, p.production_id
+    """
+    return read_df(sql)
+
+
+def _pressure_ai_same_value_run(values: np.ndarray, dates: pd.Series) -> np.ndarray:
+    """Count consecutive repeated WHP values within adjacent monthly periods."""
+    result = np.zeros(len(values), dtype=float)
+    run = 0
+    for i, value in enumerate(values):
+        if i == 0 or not np.isfinite(value):
+            run = 1 if np.isfinite(value) else 0
+        else:
+            gap = (dates.iloc[i] - dates.iloc[i - 1]).days
+            previous = values[i - 1]
+            if (
+                np.isfinite(previous)
+                and abs(float(value) - float(previous)) <= 1e-6
+                and 0 < gap <= 62
+            ):
+                run += 1
+            else:
+                run = 1
+        result[i] = run
+    return result
+
+
+def _build_pressure_ai_features(group: pd.DataFrame) -> pd.DataFrame:
+    """Reproduce the exact causal features used when training the .joblib model."""
+    g = group.copy()
+    g["pressure_date"] = pd.to_datetime(g["pressure_date"], errors="coerce")
+    g["pressure_value"] = pd.to_numeric(g["pressure_value"], errors="coerce")
+    g = g.dropna(subset=["pressure_date", "pressure_value"]).sort_values(
+        "pressure_date", kind="mergesort"
+    )
+    p = g["pressure_value"].astype(float)
+    delta = p.diff()
+    previous = p.shift(1)
+    history = p.shift(1)
+
+    prior_median = history.rolling(window=5, min_periods=2).median()
+    prior_mad = history.rolling(window=5, min_periods=2).apply(
+        lambda x: float(np.median(np.abs(x - np.median(x))), raw=True
+    )
+    residual = p - prior_median
+    robust_scale = (1.4826 * prior_mad).clip(lower=25.0)
+
+    rolling = p.rolling(window=4, min_periods=2)
+    rolling_std = rolling.std(ddof=0)
+    rolling_range = rolling.max() - rolling.min()
+    rolling_unique = rolling.apply(
+        lambda x: float(pd.Series(x).round(5).nunique()), raw=True
+    )
+    dates = g["pressure_date"].reset_index(drop=True)
+    values = p.to_numpy(dtype=float)
+
+    features = pd.DataFrame(index=g.index)
+    features["delta_psi"] = delta
+    features["abs_delta_psi"] = delta.abs()
+    features["relative_delta_pct"] = (
+        delta / previous.abs().clip(lower=25.0)
+    ) * 100.0
+    features["residual_prev_median_psi"] = residual
+    features["robust_z_prev"] = residual / robust_scale
+    features["past_mad_5_psi"] = prior_mad
+    features["rolling_std_4_psi"] = rolling_std
+    features["rolling_range_4_psi"] = rolling_range
+    features["rolling_unique_4"] = rolling_unique
+    features["same_value_run"] = _pressure_ai_same_value_run(values, dates)
+    features["delta_acceleration_psi"] = delta.diff()
+    features["days_since_previous"] = (
+        dates.diff().dt.total_seconds() / 86400.0
+    )
+    return features[_PRESSURE_AI_FEATURE_COLUMNS].replace([np.inf, -np.inf], np.nan)
+
+
+def _score_pressure_ai_dataframe(
+    source_df: pd.DataFrame,
+    model_artifact: dict[str, Any],
+) -> pd.DataFrame:
+    """Score each WHP series independently by borehole; do not mix wells."""
+    data = source_df.copy()
+    required = {"ubhi", "pressure_date", "pressure_value"}
+    missing = required - set(data.columns)
+    if missing:
+        raise ValueError(f"Thiếu trường dữ liệu WHP: {sorted(missing)}")
+
+    data["ubhi"] = data["ubhi"].astype(str).str.strip()
+    data["pressure_date"] = pd.to_datetime(data["pressure_date"], errors="coerce")
+    data["pressure_value"] = pd.to_numeric(data["pressure_value"], errors="coerce")
+    data = data.dropna(subset=["pressure_date", "pressure_value"])
+    data = data[data["ubhi"].ne("") & data["pressure_value"].gt(0)].copy()
+    if "record_id" not in data.columns:
+        data["record_id"] = data.index.astype(str)
+
+    metadata = model_artifact["metadata"]
+    threshold = float(metadata["validation"]["threshold"])
+    outputs = []
+
+    for ubhi, group in data.groupby("ubhi", sort=False):
+        group = group.sort_values(
+            ["pressure_date", "record_id"], kind="mergesort"
+        ).reset_index(drop=True)
+        features = _build_pressure_ai_features(group)
+        group = group.loc[features.index].copy().reset_index(drop=True)
+        features = features.reset_index(drop=True)
+        if group.empty:
+            continue
+
+        probabilities = model_artifact["pipeline"].predict_proba(
+            features[_PRESSURE_AI_FEATURE_COLUMNS]
+        )[:, 1]
+        group["anomaly_score"] = probabilities * 100.0
+        group["same_value_run"] = features["same_value_run"].to_numpy()
+        group["abs_delta_psi"] = features["abs_delta_psi"].to_numpy()
+        group["robust_z_prev"] = features["robust_z_prev"].to_numpy()
+
+        flatline = group["same_value_run"].ge(4)
+        model_flag = probabilities >= threshold
+        group["is_anomaly"] = flatline.to_numpy() | model_flag
+        group["alert_level"] = np.where(group["is_anomaly"], "WARNING", "NORMAL")
+
+        anomaly_types, reasons = [], []
+        for i, (_, row) in enumerate(group.iterrows()):
+            if bool(flatline.iloc[i]):
+                anomaly_types.append("PRESSURE_FLATLINE")
+                reasons.append(
+                    f"WHP lặp lại cùng một giá trị trong {int(row['same_value_run'])} kỳ liên tiếp; "
+                    "cần kiểm tra dữ liệu đo/ghi nhận."
+                )
+            elif bool(model_flag[i]):
+                if pd.notna(row["robust_z_prev"]) and abs(float(row["robust_z_prev"])) >= 3:
+                    anomaly_types.append("LOCAL_PRESSURE_DEVIATION")
+                    reasons.append(
+                        "WHP lệch mạnh so với nền áp suất gần nhất của cùng thân giếng."
+                    )
+                elif pd.notna(row["abs_delta_psi"]) and float(row["abs_delta_psi"]) >= 300:
+                    anomaly_types.append("SUDDEN_PRESSURE_CHANGE")
+                    reasons.append(
+                        "WHP thay đổi đột ngột so với kỳ trước; cần đối chiếu điều kiện khai thác."
+                    )
+                else:
+                    anomaly_types.append("ML_PATTERN_ANOMALY")
+                    reasons.append(
+                        "Mô hình nhận diện mẫu biến động WHP khác với tập nền huấn luyện."
+                    )
+            else:
+                anomaly_types.append("NORMAL")
+                reasons.append("Chưa phát hiện mẫu bất thường theo mô hình hiện tại.")
+
+        group["anomaly_type"] = anomaly_types
+        group["reason"] = reasons
+        group["model_version"] = metadata.get("model_version", "unknown")
+        outputs.append(group)
+
+    if not outputs:
+        return pd.DataFrame()
+    return pd.concat(outputs, ignore_index=True).sort_values(
+        ["ubhi", "pressure_date", "record_id"], kind="mergesort"
+    ).reset_index(drop=True)
+
+
+def render_pressure_ai_dashboard() -> None:
+    """Read current WHP, score it with the saved model and render review candidates."""
     st.markdown(
-        '<div class="overview-panel-title">CẢNH BÁO AI PHÁT HIỆN BẤT THƯỜNG ÁP SUẤT</div>',
+        '<div class="overview-panel-title">CẢNH BÁO AI PHÁT HIỆN BẤT THƯỜNG ÁP SUẤT ĐẦU GIẾNG (WHP)</div>',
         unsafe_allow_html=True,
     )
+    model_path = BASE_DIR / "epdb_pressure_whp_model.joblib"
+    if not model_path.is_file():
+        st.error("Chưa tìm thấy file epdb_pressure_whp_model.joblib.")
+        st.caption(
+            "Đặt file .joblib cùng thư mục với app.py. Nếu dashboard chạy trên máy chủ, "
+            "file phải có mặt trong thư mục triển khai trên máy chủ đó."
+        )
+        return
+
+    try:
+        artifact = _load_pressure_ai_model_cached(
+            str(model_path), int(model_path.stat().st_mtime_ns)
+        )
+    except Exception as exc:
+        st.error(
+            f"Không nạp được mô hình Pressure AI: {type(exc).__name__}: {exc}"
+        )
+        st.caption(
+            "Môi trường chạy cần có joblib và scikit-learn tương thích với model đã huấn luyện."
+        )
+        return
+
+    metadata = artifact["metadata"]
+    refresh_col, info_col = st.columns([0.30, 0.70])
+    with refresh_col:
+        if st.button(
+            "Làm mới dữ liệu WHP",
+            key="refresh_pressure_ai_data",
+            use_container_width=True,
+        ):
+            _load_pressure_ai_source_cached.clear()
+    with info_col:
+        st.caption(
+            f"Model: {metadata.get('model_version', 'unknown')} · "
+            f"Ngưỡng cảnh báo: {float(metadata['validation']['threshold']):.2f} · "
+            "Kênh áp suất: WHP (psi)"
+        )
+
+    try:
+        with st.spinner("Đang đọc dữ liệu WHP và chạy mô hình..."):
+            source = _load_pressure_ai_source_cached()
+            if source.empty:
+                st.info("CSDL hiện chưa có bản ghi WHP hợp lệ để phân tích.")
+                return
+            results = _score_pressure_ai_dataframe(source, artifact)
+    except Exception as exc:
+        st.error(
+            f"Không thể phân tích dữ liệu WHP: {type(exc).__name__}: {exc}"
+        )
+        st.caption(
+            "Ứng dụng đang dùng schema Cửu Long: epdb_production.production_month, "
+            "epdb_production.whp_psi và epdb_borehole.wellbore_code."
+        )
+        return
+
+    if results.empty:
+        st.info("Không có bản ghi WHP đủ điều kiện sau bước chuẩn hóa dữ liệu.")
+        return
+
+    alerts = results[results["is_anomaly"]].copy()
+    flatline_count = int((alerts["anomaly_type"] == "PRESSURE_FLATLINE").sum())
+    metric_cols = st.columns(4)
+    metric_cols[0].metric("Bản ghi WHP đã phân tích", f"{len(results):,}")
+    metric_cols[1].metric("Thân giếng có WHP", f"{results['ubhi'].nunique():,}")
+    metric_cols[2].metric("Bản ghi cần kiểm tra", f"{len(alerts):,}")
+    metric_cols[3].metric("Tín hiệu WHP lặp giá trị", f"{flatline_count:,}")
+
     st.info(
-        "Mô-đun AI LAS đã được ngừng sử dụng. "
-        "Dashboard sẽ hiển thị kết quả khi mô hình phát hiện bất thường áp suất được tích hợp."
+        "Đây là các bản ghi nghi vấn do mô hình sàng lọc, không phải kết luận có sự cố khai thác. "
+        "Đặc biệt, WHP lặp giá trị kéo dài có thể phản ánh dữ liệu mặc định hoặc tín hiệu đo bị đóng băng."
     )
+    st.caption(
+        "Model được huấn luyện từ dữ liệu thực hành Cửu Long và các bất thường mô phỏng. "
+        "Điểm ML (%) là điểm đầu ra của bộ phân loại, không phải xác suất xảy ra sự cố ngoài thực địa."
+    )
+
+    well_options = sorted(results["ubhi"].dropna().astype(str).unique().tolist())
+    well_labels = {}
+    for _, item in results[["ubhi", "well_name", "borehole_name"]].drop_duplicates("ubhi").iterrows():
+        code = str(item["ubhi"])
+        name = str(item.get("well_name") or "").strip()
+        well_labels[code] = f"{name} — {code}" if name and name != code else code
+
+    selected_ubhi = st.selectbox(
+        "Chọn thân giếng xem diễn biến áp suất",
+        options=well_options,
+        format_func=lambda value: well_labels.get(value, value),
+        key="pressure_ai_selected_ubhi",
+    )
+    well_results = results[results["ubhi"].astype(str) == str(selected_ubhi)].copy()
+    well_alerts = well_results[well_results["is_anomaly"]].copy()
+
+    fig = go.Figure()
+    fig.add_trace(
+        go.Scatter(
+            x=well_results["pressure_date"],
+            y=well_results["pressure_value"],
+            mode="lines+markers",
+            name="WHP",
+            line=dict(width=2, color="#245A8D"),
+            marker=dict(size=6),
+            hovertemplate="Ngày: %{x|%Y-%m-%d}<br>WHP: %{y:.1f} psi<extra></extra>",
+        )
+    )
+    if not well_alerts.empty:
+        fig.add_trace(
+            go.Scatter(
+                x=well_alerts["pressure_date"],
+                y=well_alerts["pressure_value"],
+                mode="markers",
+                name="Bản ghi nghi vấn",
+                marker=dict(size=12, color="#B42318", symbol="x"),
+                customdata=well_alerts[["anomaly_type", "anomaly_score"]],
+                hovertemplate=(
+                    "Ngày: %{x|%Y-%m-%d}<br>WHP: %{y:.1f} psi"
+                    "<br>Loại: %{customdata[0]}<br>Điểm ML: %{customdata[1]:.1f}%<extra></extra>"
+                ),
+            )
+        )
+    fig.update_layout(
+        height=360,
+        margin=dict(l=12, r=12, t=18, b=12),
+        paper_bgcolor="#FFFFFF",
+        plot_bgcolor="#FFFFFF",
+        xaxis_title="Thời gian",
+        yaxis_title="WHP (psi)",
+        legend=dict(orientation="h", y=1.12, x=0),
+        hovermode="x unified",
+    )
+    st.plotly_chart(
+        fig,
+        use_container_width=True,
+        config={"displayModeBar": False, "responsive": True},
+        key="pressure_ai_whp_timeline",
+    )
+
+    st.markdown(
+        f"<div class='overview-panel-title'>BẢN GHI WHP CẦN KIỂM TRA · {len(well_alerts):,}</div>",
+        unsafe_allow_html=True,
+    )
+    if well_alerts.empty:
+        st.success("Thân giếng đang chọn không có bản ghi vượt ngưỡng sàng lọc của mô hình.")
+    else:
+        display = well_alerts[
+            [
+                "well_name", "borehole_name", "pressure_date", "pressure_value",
+                "anomaly_score", "anomaly_type", "reason",
+            ]
+        ].copy()
+        display["pressure_value"] = display["pressure_value"].round(1)
+        display["anomaly_score"] = display["anomaly_score"].round(1)
+        display = display.rename(columns={
+            "well_name": "Giếng",
+            "borehole_name": "Thân giếng",
+            "pressure_date": "Ngày ghi nhận",
+            "pressure_value": "WHP (psi)",
+            "anomaly_score": "Điểm ML (%)",
+            "anomaly_type": "Dạng nghi vấn",
+            "reason": "Giải thích",
+        })
+        st.dataframe(
+            display,
+            use_container_width=True,
+            hide_index=True,
+            height=min(420, 90 + 38 * len(display)),
+        )
+        csv_data = display.to_csv(index=False).encode("utf-8-sig")
+        st.download_button(
+            "Tải danh sách bản ghi WHP cần kiểm tra (.csv)",
+            data=csv_data,
+            file_name=f"EPDB_Pressure_AI_{selected_ubhi}.csv",
+            mime="text/csv",
+            key="download_pressure_ai_alerts",
+        )
+
+
+if active_dashboard_view == "Cảnh báo AI":
+    render_pressure_ai_dashboard()
 
 # ---------------------------------------------------------
 # QC DETAILS (SEPARATE FROM PROPOSAL'S 4.1–4.4 VIEWS)
