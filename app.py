@@ -4954,7 +4954,7 @@ def _build_pressure_ai_features(group: pd.DataFrame) -> pd.DataFrame:
 
     prior_median = history.rolling(window=5, min_periods=2).median()
     prior_mad = history.rolling(window=5, min_periods=2).apply(
-        lambda x: float(np.median(np.abs(x - np.median(x))), raw=True
+        lambda x: float(np.median(np.abs(x - np.median(x)))), raw=True
     )
     residual = p - prior_median
     robust_scale = (1.4826 * prior_mad).clip(lower=25.0)
